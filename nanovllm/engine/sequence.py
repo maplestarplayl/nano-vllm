@@ -9,6 +9,7 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+    ABORTED = auto()
 
 
 class Sequence:
@@ -17,7 +18,9 @@ class Sequence:
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
+        self.request_id = self.seq_id
         self.status = SequenceStatus.WAITING
+        self.finish_reason = None
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
@@ -37,7 +40,7 @@ class Sequence:
 
     @property
     def is_finished(self):
-        return self.status == SequenceStatus.FINISHED
+        return self.status in {SequenceStatus.FINISHED, SequenceStatus.ABORTED}
 
     @property
     def num_completion_tokens(self):
