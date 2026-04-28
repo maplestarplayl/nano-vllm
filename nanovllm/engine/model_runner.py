@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.scheduler import ScheduleBatch, ScheduleEntry
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -97,7 +98,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(ScheduleBatch([ScheduleEntry(seq, True) for seq in seqs]))
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -188,6 +189,59 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_mixed(self, batch: ScheduleBatch):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        sample_indices = []
+        for entry in batch.entries:
+            seq = entry.seq
+            seqlen = len(seq)
+            start = min(seq.num_cached_tokens, seqlen - 1) if entry.is_prefill else seqlen - 1
+            seqlen_q = seq.num_scheduled_tokens
+            seqlen_k = seqlen
+            end = start + seqlen_q
+            input_ids.extend(seq[start:end])
+            positions.extend(range(start, end))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            start_block = start // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size
+            for i in range(start_block, end_block):
+                slot_start = seq.block_table[i] * self.block_size
+                if i == start_block:
+                    slot_start += start % self.block_size
+                if i != end_block - 1:
+                    slot_end = seq.block_table[i] * self.block_size + self.block_size
+                else:
+                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+                slot_mapping.extend(range(slot_start, slot_end))
+            sample_indices.append(cu_seqlens_q[-1] - 1)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        sample_indices = torch.tensor(sample_indices, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(batch.seqs)
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            block_tables=block_tables,
+            sample_indices=sample_indices,
+        )
+        return input_ids, positions
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -212,10 +266,18 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+    def run(self, batch: ScheduleBatch) -> list[int]:
+        if batch.is_decode_only:
+            input_ids, positions = self.prepare_decode(batch.seqs)
+            use_prefill_path = False
+        elif batch.is_prefill_only:
+            input_ids, positions = self.prepare_prefill(batch.seqs)
+            use_prefill_path = True
+        else:
+            input_ids, positions = self.prepare_mixed(batch)
+            use_prefill_path = True
+        temperatures = self.prepare_sample(batch.seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, use_prefill_path)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

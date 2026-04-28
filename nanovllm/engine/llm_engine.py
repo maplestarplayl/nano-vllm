@@ -34,6 +34,9 @@ class StepStats:
     scheduled_tokens: int
     num_waiting: int
     num_running: int
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+    is_mixed: bool = False
 
 
 class LLMEngine:
@@ -117,20 +120,22 @@ class LLMEngine:
     def step(self):
         if self.is_finished():
             return [], StepStats(False, 0, 0, 0)
-        seqs, is_prefill = self.scheduler.schedule()
-        scheduled_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        scheduler_events = self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        batch = self.scheduler.schedule()
+        token_ids = self.model_runner.call("run", batch)
+        scheduler_events = self.scheduler.postprocess(batch, token_ids)
         events = []
         for seq, token_id, finish_reason in scheduler_events:
             if finish_reason is not None:
                 self._finalize_request(seq)
             events.append(RequestEvent(seq.request_id, seq.seq_id, token_id, finish_reason))
         stats = StepStats(
-            is_prefill=is_prefill,
-            scheduled_tokens=scheduled_tokens,
+            is_prefill=batch.is_prefill_only,
+            scheduled_tokens=batch.num_tokens,
             num_waiting=len(self.scheduler.waiting),
             num_running=len(self.scheduler.running),
+            num_prefill_tokens=batch.num_prefill_tokens,
+            num_decode_tokens=batch.num_decode_tokens,
+            is_mixed=batch.is_mixed,
         )
         return events, stats
 
@@ -152,10 +157,11 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             events, stats = self.step()
-            if stats.is_prefill:
-                prefill_throughput = stats.scheduled_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = stats.scheduled_tokens / (perf_counter() - t)
+            step_time = perf_counter() - t
+            if stats.num_prefill_tokens:
+                prefill_throughput = stats.num_prefill_tokens / step_time
+            if stats.num_decode_tokens:
+                decode_throughput = stats.num_decode_tokens / step_time
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
